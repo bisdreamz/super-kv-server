@@ -12,24 +12,24 @@ public interface DataStore {
 
     /**
      * Insert data
-     * @param key
+     * @param key hash of the key
      * @param value
      */
-    public void put(byte[] key, byte[] value);
+    public void put(long key, byte[] value);
 
     /**
      * Get data
-     * @param key
-     * @return
+     * @param key hash of key
+     * @return byte array of data null if not present
      */
-    public byte[] get(byte[] key);
+    public byte[] get(long key);
 
     /**
      * Remove datta
-     * @param key
+     * @param key hash of key
      * @return boolean true if successful, false if known unrecognized key
      */
-    public boolean remove(byte[] key);
+    public boolean remove(long key);
 
     /**
      * Close and complete and shutdown needed to persist data or

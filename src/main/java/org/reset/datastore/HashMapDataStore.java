@@ -5,7 +5,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class HashMapDataStore implements DataStore {
 
-    private final ConcurrentHashMap<String, byte[]> map;
+    private final ConcurrentHashMap<Long, byte[]> map;
 
     public HashMapDataStore() {
         this.map = new ConcurrentHashMap<>();
@@ -27,18 +27,18 @@ public class HashMapDataStore implements DataStore {
     }
 
     @Override
-    public void put(byte[] key, byte[] value) {
-        this.map.put(new String(key), value);
+    public void put(long key, byte[] value) {
+        this.map.put(key, value);
     }
 
     @Override
-    public byte[] get(byte[] key) {
-        return this.map.get(new String(key));
+    public byte[] get(long key) {
+        return this.map.get(key);
     }
 
     @Override
-    public boolean remove(byte[] key) {
-        return this.map.remove(new String(key)) != null;
+    public boolean remove(long key) {
+        return this.map.remove(key) != null;
     }
 
     @Override

@@ -4,6 +4,9 @@ import java.time.Duration;
 
 public class SuperConfig {
 
+    private static final int HASHRING_TOTAL_BUCKETS = 1024;
+    private static final int HASHRING_VIRTUALNODES_PER_SERVER = 32;
+
     public static enum ExpireAfter {
         NONE,
         AFTER_WRITE,
@@ -13,6 +16,7 @@ public class SuperConfig {
     private final String datastore;
     private final Duration expiryTtl;
     private final ExpireAfter expiryMethod;
+    private final int replicas;
 
     public SuperConfig() {
         String datastore = System.getenv("DATASTORE");
@@ -37,6 +41,12 @@ public class SuperConfig {
                 throw new IllegalArgumentException("Invalid EXPIRY_METHOD value: " + expireAfter);
             }
         }
+
+        String replicasString = System.getenv("REPLICAS");
+        this.replicas = replicasString == null || replicasString.isEmpty()
+                ? 1 : Integer.parseInt(replicasString);
+        if (this.replicas < 1 || this.replicas > 100)
+            throw new IllegalArgumentException("Invalid REPLICAS value: " + replicas);
     }
 
     public String getDatastore() {
@@ -49,5 +59,23 @@ public class SuperConfig {
 
     public ExpireAfter getExpiryMethod() {
         return expiryMethod;
+    }
+
+    /**
+     * @return Number of replicas to keep of data.
+     * @implNote Default value is 1 if not specified
+     * E.g. 1 means only one server holds the key, 2 means keep an extra copy, etc
+     */
+    public int getReplicas() {
+        return replicas;
+    }
+
+    // TODO make hashring configurable
+    public int getHashringTotalBuckets() {
+        return HASHRING_TOTAL_BUCKETS;
+    }
+
+    public int getHashringVirtualNodesPerServer() {
+        return HASHRING_VIRTUALNODES_PER_SERVER;
     }
 }

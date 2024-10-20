@@ -6,6 +6,7 @@ import com.nimbus.proto.protocol.HeaderProtocol;
 import com.nimbus.proto.protocol.RequestProtocol;
 import com.nimbus.proto.protocol.ResponseProtocol;
 import io.netty.buffer.ByteBuf;
+import net.openhft.hashing.LongHashFunction;
 import org.reset.datastore.DataStore;
 
 import java.util.function.Function;
@@ -13,19 +14,25 @@ import java.util.function.Function;
 public class CommandHandler {
 
     private final DataStore dataStore;
+    private final LongHashFunction hashFunction;
     private Function<ByteBuf, ByteBuf>[] commands;
 
-    public CommandHandler(DataStore dataStore) {
+    public CommandHandler(DataStore dataStore, LongHashFunction hashFunction) {
         this.dataStore = dataStore;
-        this.commands = new Function[4];
+        this.hashFunction = hashFunction;
+        this.commands = new Function[101];
 
         this.commands[RequestProtocol.CMD_SET] = this::set;
         this.commands[RequestProtocol.CMD_GET] = this::get;
         this.commands[RequestProtocol.CMD_DEL] = this::delete;
+
+        this.commands[RequestProtocol.REPL_CMD_ECHO] = this::echo;
     }
 
     public ByteBuf process(ByteBuf msg) {
         int cmd = RequestProtocol.getCommand(msg);
+
+        System.out.println(cmd);
 
         if (cmd < 0 || cmd >= commands.length)
             return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).buffer();
@@ -51,7 +58,7 @@ public class CommandHandler {
             byte[] key = req.key();
             byte[] value = req.value();
 
-            dataStore.put(key, value);
+            dataStore.put(hashFunction.hashBytes(key), value);
         }
 
         return ResponseMessage.of(req.buffer(), ResponseProtocol.STATUS_OK, count).end();
@@ -67,7 +74,6 @@ public class CommandHandler {
         System.out.println("Compression " + compressed);
 
         int count = req.count();
-        System.out.println("Count " + count);
         if (count <= 0)
             return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).end();
 
@@ -76,7 +82,7 @@ public class CommandHandler {
         int found = 0;
         for (int x = 0; x < count; x++) {
             byte[] key = req.key();
-            byte[] val = dataStore.get(key);
+            byte[] val = dataStore.get(hashFunction.hashBytes(key));
 
             System.out.println(new String(key));
 
@@ -106,13 +112,33 @@ public class CommandHandler {
         int deleted = 0;
         for (int c = 0; c < count; c++) {
             byte[] key = req.key();
-            if (dataStore.remove(key)) {
+            if (dataStore.remove(hashFunction.hashBytes(key))) {
                 deleted++;
             }
         }
 
         ResponseMessage res = new ResponseMessage(req);
         res.count(deleted);
+
+        return res.end();
+    }
+
+    ByteBuf echo(ByteBuf msg) {
+        RequestMessage req = new RequestMessage(msg);
+
+        int count = req.count();
+        if (count <= 0)
+            return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).end();
+
+        byte[] data = req.value();
+        if (data == null || data.length == 0)
+            return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).end();
+
+        ResponseMessage res = new ResponseMessage(req);
+        res.count(1);
+        res.value(data);
+
+        System.out.println("Echoing " + new String(data));
 
         return res.end();
     }

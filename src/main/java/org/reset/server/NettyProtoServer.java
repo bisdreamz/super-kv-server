@@ -95,7 +95,6 @@ public class NettyProtoServer {
             if (in.readableBytes() < HeaderProtocol.HDR_TOTAL_LEN.sizeBytes())
                 return;
 
-
             int length = in.getInt(in.readerIndex());
 
             if (in.readableBytes() < length)
