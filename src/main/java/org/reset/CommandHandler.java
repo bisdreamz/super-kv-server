@@ -55,11 +55,13 @@ public class CommandHandler {
             return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).buffer();
 
         for (int x = 0; x < count; x++) {
-            byte[] key = req.key();
-            byte[] value = req.value();
+            byte[] key = req.keyAsBytes();
+            byte[] value = req.valueAsBytes();
 
             dataStore.put(hashFunction.hashBytes(key), value);
         }
+
+        System.out.println("Set " + count + " keys");
 
         return ResponseMessage.of(req.buffer(), ResponseProtocol.STATUS_OK, count).end();
     }
@@ -81,7 +83,7 @@ public class CommandHandler {
 
         int found = 0;
         for (int x = 0; x < count; x++) {
-            byte[] key = req.key();
+            byte[] key = req.keyAsBytes();
             byte[] val = dataStore.get(hashFunction.hashBytes(key));
 
             System.out.println(new String(key));
@@ -93,6 +95,8 @@ public class CommandHandler {
             if (val != null) {
                 res.key(key);
                 res.value(val);
+                System.out.println("keylen " + key.length + " vallen " + val.length);
+                System.out.println("Wrote " + new String(key) + " -> " + new String(val));
                 found++;
             }
         }
@@ -111,7 +115,7 @@ public class CommandHandler {
 
         int deleted = 0;
         for (int c = 0; c < count; c++) {
-            byte[] key = req.key();
+            byte[] key = req.keyAsBytes();
             if (dataStore.remove(hashFunction.hashBytes(key))) {
                 deleted++;
             }
@@ -130,7 +134,7 @@ public class CommandHandler {
         if (count <= 0)
             return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).end();
 
-        byte[] data = req.value();
+        byte[] data = req.valueAsBytes();
         if (data == null || data.length == 0)
             return ResponseMessage.of(msg, ResponseProtocol.STATUS_INVALID_REQ, 0).end();
 

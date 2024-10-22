@@ -8,8 +8,6 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.logging.LogLevel;
-import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.codec.ByteToMessageDecoder;
 
 import java.util.List;
@@ -105,7 +103,7 @@ public class NettyProtoServer {
         }
     }
 
-    private static class RequestHandler extends SimpleChannelInboundHandler<ByteBuf> {
+    public class RequestHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         private final Function<ByteBuf, ByteBuf> requestHandler;
 
@@ -114,24 +112,37 @@ public class NettyProtoServer {
         }
 
         @Override
-        protected void messageReceived(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
+        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
             ByteBuf response = null;
             try {
+                // Process the incoming message and generate a response
                 response = requestHandler.apply(msg);
 
-                if (response == msg)
+                // If the response is the same as the incoming message, retain it to prevent it from being released
+                if (response == msg) {
                     msg.retain();
+                }
 
+                // Write and flush the response to the client
                 ctx.writeAndFlush(response);
             } catch (Exception e) {
-                ctx.writeAndFlush(ctx.alloc().buffer().writeBytes(("Error: " + e.getMessage()).getBytes()));
+                // In case of an exception, write an error message back to the client and close the connection
+                ByteBuf errorBuf = ctx.alloc().buffer();
+                errorBuf.writeBytes(("Error: " + e.getMessage()).getBytes());
+                ctx.writeAndFlush(errorBuf);
                 ctx.close();
-                System.out.println("Error: " + e.getMessage());
-            } finally {
-                if (response != msg) {
-                    msg.release();
-                }
+
+                // Log the error for debugging purposes
+                System.err.println("Error: " + e.getMessage());
             }
+            // No need for a finally block to release 'msg' because Netty 4.2's SimpleChannelInboundHandler releases it automatically
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+            // Handle unexpected exceptions to prevent the application from crashing
+            cause.printStackTrace();
+            ctx.close();
         }
     }
 }
