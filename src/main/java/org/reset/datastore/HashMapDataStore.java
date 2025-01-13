@@ -27,18 +27,18 @@ public class HashMapDataStore implements DataStore {
     }
 
     @Override
-    public void put(long key, byte[] value) {
-        this.map.put(key, value);
+    public void put(long keyHash, byte[] keyData, byte[] valueData) {
+        this.map.put(keyHash, valueData);
     }
 
     @Override
-    public byte[] get(long key) {
-        return this.map.get(key);
+    public byte[] get(long keyHash) {
+        return this.map.get(keyHash);
     }
 
     @Override
-    public boolean remove(long key) {
-        return this.map.remove(key) != null;
+    public boolean remove(long keyHash) {
+        return this.map.remove(keyHash) != null;
     }
 
     @Override

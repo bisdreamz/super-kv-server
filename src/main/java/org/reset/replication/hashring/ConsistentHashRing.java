@@ -1,24 +1,27 @@
-package org.reset.replication;
+package org.reset.replication.hashring;
 
+import com.nimbus.routing.HashConstants;
 import net.openhft.hashing.LongHashFunction;
 import org.reset.replication.discovery.BucketPeer;
 import org.reset.replication.discovery.Peer;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Manages the consistent hash ring, bucket assignments, and replica distributions.
  * Optimized for fast, low-garbage lookups and graceful handling of server failures.
  */
 public class ConsistentHashRing {
+
     private final SortedMap<Long, Peer> hashRing;
     private final int virtualNodesPerServer;
     private final int replicationFactor;
     private final int totalBuckets;
     private final LongHashFunction hashFunction;
     private final List<BucketPeer> bucketPeers;
-    private final Map<String, List<Peer>> bucketToReplicasMap;
+    private final Map<String, BucketReplicasEntry> bucketToReplicasMap;
     private final Map<String, List<Integer>> serverToBucketsMap;
 
     /**
@@ -26,9 +29,9 @@ public class ConsistentHashRing {
      * and assisting in re-assigning or re-balancing buckets when servers come up or go down.
      * @param totalBuckets Total data buckets to split keyspace into, higher value means
      *                     more to compare during integrity checks but improved distribution of data
-     * @param virtualNodesPerServer
-     * @param replicationFactor
-     * @param hashFunction
+     * @param virtualNodesPerServer Number of virtual nodes per physical server
+     * @param replicationFactor Number of replicas to maintain for each bucket
+     * @param hashFunction Hash function to use for consistent hashing
      */
     public ConsistentHashRing(int totalBuckets, int virtualNodesPerServer, int replicationFactor,
                               LongHashFunction hashFunction) {
@@ -41,6 +44,17 @@ public class ConsistentHashRing {
         this.replicationFactor = replicationFactor;
         this.totalBuckets = totalBuckets;
         this.hashFunction = hashFunction;
+    }
+
+    /**
+     * Primary method for getting bucket and replica information for a key
+     * @param precomputedHash the precomputed hash of the key
+     * @return BucketReplicasEntry containing bucket ID and replica peers
+     */
+    public BucketReplicasEntry getReplicasForKey(long precomputedHash) {
+        int bucketId = getBucketFromHash(precomputedHash);
+        String bucketKey = "Bucket-" + bucketId;
+        return getReplicas(bucketKey);
     }
 
     /**
@@ -60,11 +74,30 @@ public class ConsistentHashRing {
     }
 
     /**
-     * Removes a server and its virtual nodes from the hash ring.
+     * Removes a server from the ring and returns affected bucket reassignments.
+     * This handles both planned removals and failure scenarios.
      *
      * @param server Peer instance representing the server to remove.
+     * @return Map of affected bucket IDs to their new replica assignments
      */
-    public void removeServer(Peer server) {
+    public Map<Integer, DataMovementPlan> removeServer(Peer server) {
+        // Get current assignments before removal
+        Map<Integer, Set<Peer>> currentHolders = new HashMap<>();
+        Set<Integer> affectedBuckets = new HashSet<>();
+
+        // Capture which peers currently hold each bucket's data
+        // AND capture affected buckets before we clear anything
+        for (BucketPeer bucketPeer : getBucketPeers()) {
+            Set<Peer> replicas = new HashSet<>(bucketPeer.getReplicas());
+            currentHolders.put(bucketPeer.getBucketId(), replicas);
+
+            // If this bucket has the server we're removing, it's affected
+            if (replicas.contains(server)) {
+                affectedBuckets.add(bucketPeer.getBucketId());
+            }
+        }
+
+        // Remove server from ring
         for (int i = 0; i < virtualNodesPerServer; i++) {
             String virtualNodeId = generateVirtualNodeId(server.getHost(), i);
             long hash = hashFunction.hashChars(virtualNodeId);
@@ -72,18 +105,69 @@ public class ConsistentHashRing {
         }
 
         serverToBucketsMap.remove(server.getHost());
+
+        // Reassign all buckets (this updates virtual node mappings)
         this.assignBuckets();
+
+        // Create movement plans for affected buckets
+        Map<Integer, DataMovementPlan> movementPlans = new HashMap<>();
+
+        for (int bucketId : affectedBuckets) {  // Use our captured set instead of getAffectedBuckets
+            // Get original holders minus the removed server
+            Set<Peer> originalHolders = new HashSet<>(currentHolders.get(bucketId));
+            originalHolders.remove(server);
+
+            // Get new assignments after virtual node remapping
+            BucketPeer newBucketPeer = getBucketPeers().get(bucketId);
+            Set<Peer> newAssignees = new HashSet<>(newBucketPeer.getReplicas());
+
+            // Find which of the new assignees don't already have the data
+            Set<Peer> peersNeedingData = new HashSet<>(newAssignees);
+            peersNeedingData.removeAll(originalHolders);
+
+            // Always create a plan for affected buckets
+            movementPlans.put(bucketId, new DataMovementPlan(
+                    bucketId,
+                    originalHolders,
+                    peersNeedingData
+            ));
+        }
+
+        return movementPlans;
+    }
+
+    /**
+     * Gets all buckets that would be affected by removing a server
+     * @param server The server to check
+     * @return Set of affected bucket IDs
+     */
+    public Set<Integer> getAffectedBuckets(Peer server) {
+        Set<Integer> affectedBuckets = new HashSet<>();
+        List<Integer> buckets = serverToBucketsMap.get(server.getHost());
+
+        if (buckets != null) {
+            affectedBuckets.addAll(buckets);
+        }
+
+        return affectedBuckets;
     }
 
     /**
      * Generates a unique identifier for a virtual node.
      *
      * @param serverHost Host identifier of the server.
-     * @param index      Index of the virtual node.
+     * @param index Index of the virtual node.
      * @return Unique virtual node identifier.
      */
     private String generateVirtualNodeId(String serverHost, int index) {
         return serverHost + "-VN" + index;
+    }
+
+    /**
+     * Gets bucket assignment for a precomputed hash
+     */
+    private int getBucketFromHash(long precomputedHash) {
+        return (int) (Math.abs(precomputedHash) % totalBuckets);
     }
 
     /**
@@ -93,24 +177,26 @@ public class ConsistentHashRing {
     private void assignBuckets() {
         bucketPeers.clear();
         bucketToReplicasMap.clear();
+
+        // Don't clear serverToBucketsMap until after we've used its keys
+        Set<String> currentServers = new HashSet<>(serverToBucketsMap.keySet());
         serverToBucketsMap.clear();
 
-        for (String serverHost : serverToBucketsMap.keySet()) {
+        // Initialize empty lists for all known servers
+        for (String serverHost : currentServers) {
             serverToBucketsMap.put(serverHost, new ArrayList<>());
         }
 
         for (int bucketId = 0; bucketId < totalBuckets; bucketId++) {
             String bucketKey = "Bucket-" + bucketId;
-            List<Peer> replicas = getReplicas(bucketKey);
-            BucketPeer bucketPeer = new BucketPeer(bucketId, replicas);
+            BucketReplicasEntry replicas = getReplicas(bucketKey);
+            BucketPeer bucketPeer = new BucketPeer(bucketId, replicas.getPeers());
             bucketPeers.add(bucketPeer);
 
-            // Update bucket-to-replicas cache
-            bucketToReplicasMap.put(bucketKey, Collections.unmodifiableList(replicas));
-
             // Update server to buckets mapping
-            for (Peer peer : replicas) {
-                serverToBucketsMap.computeIfAbsent(peer.getHost(), k -> new ArrayList<>()).add(bucketId);
+            for (Peer peer : replicas.getPeers()) {
+                serverToBucketsMap.computeIfAbsent(peer.getHost(), k -> new ArrayList<>())
+                        .add(replicas.getBucket());
             }
         }
     }
@@ -119,20 +205,23 @@ public class ConsistentHashRing {
      * Retrieves the list of replica peers for a given bucket key.
      *
      * @param bucketKey The key representing the bucket.
-     * @return Unmodifiable list of Peer instances assigned as replicas.
+     * @return BucketReplicasEntry containing bucket and replica information
      */
-    public List<Peer> getReplicas(String bucketKey) {
+    private BucketReplicasEntry getReplicas(String bucketKey) {
         // Check if the bucket's replicas are already cached
-        List<Peer> cachedReplicas = bucketToReplicasMap.get(bucketKey);
-        if (cachedReplicas != null)
-            return cachedReplicas;
+        BucketReplicasEntry cached = bucketToReplicasMap.get(bucketKey);
+        if (cached != null) {
+            return cached;
+        }
 
-        // If not cached, compute the replicas and cache them
+        // If not cached, compute the replicas
         List<Peer> replicas = new ArrayList<>();
         long hash = hashFunction.hashChars(bucketKey);
+        int bucketId = Integer.parseInt(bucketKey.split("-")[1]);
 
-        if (hashRing.isEmpty())
-            return replicas;
+        if (hashRing.isEmpty()) {
+            return new BucketReplicasEntry(Collections.unmodifiableList(replicas), bucketId);
+        }
 
         // Tail map from the bucket's hash to the end of the ring
         SortedMap<Long, Peer> tailMap = hashRing.tailMap(hash);
@@ -149,19 +238,23 @@ public class ConsistentHashRing {
         // If not enough replicas found, wrap around the ring
         if (replicas.size() < replicationFactor) {
             for (Peer peer : hashRing.values()) {
-                if (replicas.size() >= replicationFactor)
+                if (replicas.size() >= replicationFactor) {
                     break;
-
-                if (!replicas.contains(peer))
+                }
+                if (!replicas.contains(peer)) {
                     replicas.add(peer);
+                }
             }
         }
 
-        // Cache the computed replicas
-        List<Peer> unmodifiableReplicas = Collections.unmodifiableList(replicas);
-        bucketToReplicasMap.put(bucketKey, unmodifiableReplicas);
+        // Create and cache the entry
+        BucketReplicasEntry entry = new BucketReplicasEntry(
+                Collections.unmodifiableList(replicas),
+                bucketId
+        );
+        bucketToReplicasMap.put(bucketKey, entry);
 
-        return unmodifiableReplicas;
+        return entry;
     }
 
     /**
@@ -189,113 +282,16 @@ public class ConsistentHashRing {
     }
 
     /**
-     * Retrieves the list of replicas for a given data key.
-     * This method maps the data key to its corresponding bucket and returns the replicas.
-     *
-     * @param dataKey The key representing the data.
-     * @return Unmodifiable list of Peer instances assigned as replicas.
-     */
-    public List<Peer> getReplicasForDataKey(String dataKey) {
-        // Determine the bucket for the data key
-        int bucketId = determineBucketId(dataKey);
-        String bucketKey = "Bucket-" + bucketId;
-        return getReplicas(bucketKey);
-    }
-
-    /**
-     * Determines the bucket ID for a given data key.
-     *
-     * @param dataKey The key representing the data.
-     * @return The bucket ID.
-     */
-    private int determineBucketId(String dataKey) {
-        // Simple hash to bucket mapping using modulo
-        long hash = hashFunction.hashChars(dataKey);
-        return (int) (hash % totalBuckets);
-    }
-
-    /**
-     * Identifies all buckets that have the specified server as a replica.
-     *
-     * @param serverHost The host identifier of the server.
-     * @return Set of bucket IDs that are assigned to the server.
-     */
-    public Set<Integer> getAffectedBucketsOnFailure(String serverHost) {
-        Set<Integer> affectedBuckets = new HashSet<>();
-        List<Integer> buckets = serverToBucketsMap.get(serverHost);
-
-        if (buckets != null)
-            affectedBuckets.addAll(buckets);
-
-        return affectedBuckets;
-    }
-
-    /**
-     * Reassigns replicas for affected buckets after a server failure.
-     *
-     * @param failedServerHost The host identifier of the failed server.
-     * @return Map of bucket IDs to their new replica peers.
-     */
-    public Map<Integer, List<Peer>> handleServerFailure(String failedServerHost) {
-        // Step 1: Identify affected buckets
-        Set<Integer> affectedBuckets = getAffectedBucketsOnFailure(failedServerHost);
-        System.out.println("Affected Buckets: " + affectedBuckets.size());
-
-        // Step 2: Remove the failed server from the hash ring
-        Peer failedServer = null;
-        for (Peer server : hashRing.values()) {
-            if (server.getHost().equals(failedServerHost)) {
-                failedServer = server;
-                break;
-            }
-        }
-
-        if (failedServer != null) {
-            removeServer(failedServer);
-        } else {
-            System.out.println("Server " + failedServerHost + " not found in the hash ring.");
-            return Collections.emptyMap();
-        }
-
-        // Step 3: Reassign replicas for affected buckets
-        Map<Integer, List<Peer>> reassignedBuckets = new HashMap<>();
-        for (Integer bucketId : affectedBuckets) {
-            String bucketKey = "Bucket-" + bucketId;
-            List<Peer> newReplicas = getReplicas(bucketKey);
-            reassignedBuckets.put(bucketId, newReplicas);
-        }
-
-        // Step 4: Update bucketPeers and serverToBucketsMap accordingly
-        for (Integer bucketId : affectedBuckets) {
-            String bucketKey = "Bucket-" + bucketId;
-            List<Peer> newReplicas = reassignedBuckets.get(bucketId);
-            // Update BucketPeer
-            BucketPeer bucketPeer = new BucketPeer(bucketId, newReplicas);
-            bucketPeers.set(bucketId, bucketPeer);
-            // Update bucketToReplicasMap
-            bucketToReplicasMap.put(bucketKey, Collections.unmodifiableList(newReplicas));
-        }
-
-        // Step 5: Update serverToBucketsMap for new replicas
-        // Clear and rebuild serverToBucketsMap to ensure consistency
-        rebuildServerToBucketsMap();
-
-        // Step 6: Return the mapping of bucket IDs to new replicas for data redistribution
-        return reassignedBuckets;
-    }
-
-    /**
      * Rebuilds the serverToBucketsMap based on current bucketToReplicasMap.
      * This ensures that the mapping remains consistent after reassignments.
      */
     private void rebuildServerToBucketsMap() {
         serverToBucketsMap.clear();
-        for (Map.Entry<String, List<Peer>> entry : bucketToReplicasMap.entrySet()) {
-            String bucketKey = entry.getKey();
-            List<Peer> replicas = entry.getValue();
-            int bucketId = Integer.parseInt(bucketKey.split("-")[1]);
-            for (Peer peer : replicas) {
-                serverToBucketsMap.computeIfAbsent(peer.getHost(), k -> new ArrayList<>()).add(bucketId);
+        for (Map.Entry<String, BucketReplicasEntry> entry : bucketToReplicasMap.entrySet()) {
+            BucketReplicasEntry replicaEntry = entry.getValue();
+            for (Peer peer : replicaEntry.getPeers()) {
+                serverToBucketsMap.computeIfAbsent(peer.getHost(), k -> new ArrayList<>())
+                        .add(replicaEntry.getBucket());
             }
         }
     }
@@ -318,7 +314,12 @@ public class ConsistentHashRing {
 
         // Initialize ConsistentHashRing
         ConsistentHashRing hashRing = new ConsistentHashRing(
-                virtualNodesPerServer, replicationFactor, totalBuckets, LongHashFunction.xx3());
+                totalBuckets, virtualNodesPerServer, replicationFactor, LongHashFunction.xx3());
+
+        // Add servers to the ring
+        for (Peer server : servers) {
+            hashRing.addServer(server);
+        }
 
         // Display bucket assignments for the first 20 buckets
         System.out.println("Initial Bucket Assignments (First 20 Buckets):");
@@ -335,31 +336,30 @@ public class ConsistentHashRing {
             System.out.println(server.getHost() + " is responsible for " + assignedBuckets.size() + " replicas.");
         }
 
-        // Simulate server failure
-        String failedServerHost = "Server-C";
-        System.out.println("\n--- Simulating Failure of " + failedServerHost + " ---\n");
-        Map<Integer, List<Peer>> reassignedBuckets = hashRing.handleServerFailure(failedServerHost);
+        // Example of handling server removal
+        Peer serverToRemove = serverC;
+        System.out.println("\n--- Removing " + serverToRemove.getHost() + " ---\n");
 
-        // Display bucket assignments after failure for the first 20 buckets
-        System.out.println("Bucket Assignments After Failure of " + failedServerHost + " (First 20 Buckets):");
-        for (int i = 0; i < 20; i++) {
-            BucketPeer bucketPeer = hashRing.getBucketPeers().get(i);
-            System.out.println(bucketPeer);
+        // Get affected buckets before removal
+        Set<Integer> willBeAffected = hashRing.getAffectedBuckets(serverToRemove);
+        System.out.println("Buckets that will be affected: " + willBeAffected.size());
+
+        // Remove server and get reassignments
+        Map<Integer, DataMovementPlan> reassignments = hashRing.removeServer(serverToRemove);
+
+        // Display reassignments
+        System.out.println("\nBucket Reassignments:");
+        for (Map.Entry<Integer, DataMovementPlan> entry : reassignments.entrySet()) {
+            System.out.println("Bucket " + entry.getKey() + " -> " +
+                    entry.getValue().getNewRecipients());
         }
 
-        // Display updated replica distribution across remaining servers
-        System.out.println("\nReplica Distribution Across Remaining Servers:");
-        serverToBuckets = hashRing.getServerToBucketsMap();
-        List<Peer> remainingServers = new ArrayList<>(servers);
-        remainingServers.removeIf(server -> server.getHost().equals(failedServerHost));
-        for (Peer server : remainingServers) {
-            List<Integer> assignedBuckets = serverToBuckets.getOrDefault(server.getHost(), Collections.emptyList());
-            System.out.println(server.getHost() + " is responsible for " + assignedBuckets.size() + " replicas.");
-        }
-
-        // Example client lookup
+        // Example client lookup using precomputed hash
         String dataKey = "user1234";
-        List<Peer> replicas = hashRing.getReplicasForDataKey(dataKey);
-        System.out.println("\nReplicas for data key '" + dataKey + "': " + replicas);
+        long keyHash = HashConstants.HASH_FUNCTION.hashChars(dataKey);
+        BucketReplicasEntry replicaInfo = hashRing.getReplicasForKey(keyHash);
+        System.out.println("\nFor data key '" + dataKey + "':");
+        System.out.println("Bucket: " + replicaInfo.getBucket());
+        System.out.println("Replicas: " + replicaInfo.getPeers());
     }
 }

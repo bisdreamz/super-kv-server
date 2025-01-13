@@ -1,18 +1,18 @@
 package org.reset.replication;
 
+import com.nimbus.net.Node;
 import net.openhft.hashing.LongHashFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.reset.replication.discovery.AbstractPeerDiscovery;
+import org.reset.datastore.DataStore;
 import org.reset.replication.discovery.Peer;
 import org.reset.replication.discovery.StaticPeerDiscovery;
-import org.reset.replication.merkle.SimpleLeaf;
-import org.reset.replication.merkle.SimpleMerkle;
+import org.reset.replication.hashring.BucketReplicasEntry;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
 
 public class ReplicationManager {
 
@@ -24,130 +24,143 @@ public class ReplicationManager {
     // Discovery of peer nodes, in particular the peer bucket replica(s) if any
     //
     // Should handle snapshotting of data for replication
-    private final SimpleMerkle merkle;
-    private final AbstractPeerDiscovery peerDiscovery;
-    private final ConsistentHashRing hashRing;
-    private final List<Peer> peers;
+    private final DataStore dataStore;
+    private final LongHashFunction hashFunction;
+    private final LocalReplicationCluster localReplicationCluster;
+    private final List<ExternalReplicationCluster> externalReplicationClusters;
 
-    public ReplicationManager(LongHashFunction hashFunction, int totalBuckets,
+    public ReplicationManager(DataStore dataStore, LongHashFunction hashFunction, int totalBuckets,
                               int virtualNodesPerServer, int replicationFactor) {
-        this.merkle = new SimpleMerkle(totalBuckets, hashFunction);
-        this.peerDiscovery = new StaticPeerDiscovery(List.of(new Peer("localhost", true)));
-        this.hashRing = new ConsistentHashRing(totalBuckets, virtualNodesPerServer, replicationFactor,
-                hashFunction);
-        this.peers = new ArrayList<>();
+        this.dataStore = dataStore;
+        this.hashFunction = hashFunction;
 
-        this.peerDiscovery.onPeerChanged(this::handlePeerChange);
+        this.localReplicationCluster = new LocalReplicationCluster(
+                new StaticPeerDiscovery(List.of(new Peer("localhost", true))),
+                hashFunction,
+                totalBuckets,
+                virtualNodesPerServer,
+                replicationFactor);
+
+        this.externalReplicationClusters = new ArrayList<>();
+    }
+
+    private boolean hasReplicaPeers(BucketReplicasEntry entry) {
+        if (entry == null)
+            throw new NullPointerException("Cant't replicate a null entry");
+
+        if (entry.getPeers() == null || entry.getPeers().isEmpty())
+            throw new IllegalArgumentException("Peer list is bucket replicas was null or empty!");
+
+        if (entry.getPeers().size() == 1 && entry.getPeers().getFirst().isSelf())
+            return false;
+
+        return true;
     }
 
     public CompletableFuture<Void> start() {
-        return this.peerDiscovery.init().thenAccept(peers -> {
-            if (peers == null || peers.isEmpty())
-                throw new IllegalStateException("Peer discovery failed, no peers found");
-            else if (peers.size() == 1 && peers.getFirst().isSelf())
-                log.info("No peers discovered, but at least I have self!");
+        // start local and external replica clusters
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-            // TODO logic to assign buckets
-            this.peers.addAll(peers);
+        CompletableFuture<Void> localFut = this.localReplicationCluster.start().thenRun(() -> {
+            log.info("Local replication service started");
+        });
 
-            peers.forEach(this.hashRing::addServer);
+        futures.add(localFut);
 
-            log.info("Discovered {} peers ({}), registered with hashring",
-                    peers.size(), String.join(", ", peers.stream().map(p -> p.getHost()).toList()));
+        this.externalReplicationClusters.forEach(externalReplicationCluster -> {
+            CompletableFuture<Void> externalFut = externalReplicationCluster.start().thenRun(() -> {
+               log.info("External replication service started for cluster {}",
+                       externalReplicationCluster.getClusterHost());
+            });
+
+            futures.add(externalFut);
+        });
+
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[futures.size()])).thenRun(() -> {
+           log.info("All replicateion services ready");
         });
     }
 
     public CompletableFuture<Void> stop() {
-        return this.peerDiscovery.shutdown().thenRun(() -> {
-            log.info("Peer discovery service closed, unregistered self.");
-        }).thenRun(() -> {
-            log.debug("Awaiting some time to provide servers to process");
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-            // do things to rebalance out data here
+        CompletableFuture<Void> localFut = this.localReplicationCluster.stop().thenRun(() -> {
+            log.info("Local replication service stopped");
+        });
+
+        futures.add(localFut);
+
+        this.externalReplicationClusters.forEach(externalReplicationCluster -> {
+            CompletableFuture<Void> externalFut = externalReplicationCluster.stop().thenRun(() -> {
+                log.info("External replication service stopped for cluster {}",
+                        externalReplicationCluster.getClusterHost());
+            });
+
+            futures.add(externalFut);
+        });
+
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[futures.size()])).thenRun(() -> {
+            log.info("All replicateion services shutdown");
         });
     }
 
-    /*
-        Monitor changes to peers. If one goes down, re-assess buckets and kick off a rebalance
-        if needed. If one comes up, assess need to rebalance or replication.
-        We rely on the peer discovery service to ensure reliable event notifications here,
-        e.g. ensuring confidence in a node being down.
-        If a rebalance is already happening and we need to start another,
-        we should cancel the current rebalance in place and restart a new job.
+    /**
+     * Sets or updates a key value for replication and synchronization with the local
+     * cluster and external(s) if applicable.
+     * @param keyHash
+     * @param keyData
+     * @param valueData
+     * @return true if successful, false if this key is determined to belong to
+     * different servers!
      */
-    private void handlePeerChange(Peer peer) {
-        if (peer.getState() == Peer.State.UP) {
-            // if SELF
-            //    if NEW NODE send replication data request to peer, if they have any data?
-            //    else if NODE RECOVERING send a
+    public boolean keyUpdate(long keyHash, byte[] keyData, byte[] valueData) {
+        long valueHash = this.hashFunction.hashBytes(valueData);
+
+        System.out.println("keyUpdate set");
+        int localBucket = this.localReplicationCluster.set(keyHash, valueHash);
+        if (localBucket == -1) {
+            log.warn("Got insert for key which doesnt belong to our server");
+            return false;
         }
+        this.externalReplicationClusters.forEach(externalReplicationCluster -> {
+            externalReplicationCluster.set(keyHash, valueHash);
+        });
 
-        Peer exists = peers.stream().filter(p -> p.getHost().equals(peer.getHost())).findFirst().orElse(null);
+        return true;
 
-        // We should always recognize node events unless its a brand new node coming up
-        if (peer.getState() != Peer.State.UP && exists == null) {
-            log.warn("Unrecognized peer {} non-UP state change to {}, ignoring!", peer.getHost(), peer.getState());
-            return;
-        }
-
-        // TODO need to make sure our server peer list is up to date if coming back up before making any decisions
-        if (!peer.isSelf()) {
-            switch (peer.getState()) {
-                case DOWN_MANAGER, DOWN_PROBE:
-                    log.info("Peer {} went down for reason {}, removing from peer list",
-                            peer.getHost(), peer.getState());
-                    this.peers.remove(exists);
-                    // TODO update server buckets, kick off rebalance if needed?
-                    // watch job to redistribute data if enough servers go down to
-                    // reduce bucket counts? e.g. if 2 different bucket replicas go down
-                    // we can still operate with only 1 replica per bucket
-                    // but if they are eventually down for good then redistribute
-                    // so all servers have proper replica counts.
-                    // We initiate this if the server that went down was our replica,
-                    // then we are responsible for deciding to begin this process
-                    break;
-                case UP:
-                    if (exists != null) {
-                        log.warn("Peer {} notice of state change to UP, but already UP. Ignoring!", peer.getHost());
-                        break;
-                    }
-                    this.peers.add(peer);
-                    break;
-                default:
-                    throw new IllegalStateException("Unhandled peer state: " + peer.getState());
-            }
-
-            return;
-        }
-
-        // This is a notification about the node we are running on (SELF),
-        // keep our own entry and handle as needed
-        if (peer.getState() == Peer.State.UP) {
-            if (exists.getState() != Peer.State.UP) {
-                log.info("Self node was down but is back UP, kicking off synchronization checks..");
-            } else {
-                // Ugh, we are up already?
-            }
-        } else {
-            // Being told we are down lol, hang out until we regain network access or whatever
-            // is wrong then can resync and resume service
-            log.warn("Received notice that self node is down, hanging out until we can rejoin the cluster..");
-        }
-
-        exists.setState(peer.getState());
-    }
-
-    public void keyUpdate(byte[] key, byte[] value) {
-        SimpleLeaf leaf = this.merkle.set(key, value);
         // TODO add to replication queue, including timestamp from leaf to ensure consistency
     }
 
-    public void keyDelete(byte[] key) {
-        SimpleLeaf leaf = this.merkle.delete(key);
-        if (leaf == null)
-            return; // nothing to do, didnt exist
+    public boolean keyDelete(long keyHash) {
+        int localBucket = this.localReplicationCluster.delete(keyHash);
+        this.externalReplicationClusters.forEach(externalReplicationCluster -> {
+            externalReplicationCluster.delete(keyHash);
+        });
 
-        // TODO add to replication queue
+        if (localBucket == -1) {
+            log.warn("Got delete for key which doesnt belong to our server");
+            return false;
+        }
+
+        log.debug("Deleted key with hash {}", keyHash);
+
+        return true;
+    }
+
+    public Map<Integer, List<Node>> getLocalBucketMapping() {
+        return this.localReplicationCluster.getBucketReplicasMap();
+    }
+
+    private void sync() {
+        // we initiate this when we feel like our server needs data?
+        // dont run if another job or rebalance job running
+
+        // need to ask other random replica server from each of our buckets
+        // to send us data we are missing. Perhaps we send them a request
+        // which includes the timestamp, bucket index, and hash value
+        // and then they can directly respond with the data we are missing?
+
+        // need to track how much data entries were actually missing or stale
     }
 
 }
